@@ -8,66 +8,177 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
 
-// SetupManager handles environment and source code installation.
-// - InstallDir: Root path for the tool
-// - CondaDir: Path to miniconda
-// - FDDir: Path to FontDiffuser source
-// - EnvName: Name of the conda environment
+// SetupManager handles the preparation of external resources on the host machine
 type SetupManager struct {
-	InstallDir string
-	CondaDir   string
-	FDDir      string
-	EnvName    string
+	InstallDir     string
+	AssetsDir      string
+	CheckpointsDir string
 }
 
+// NewSetupManager initializes a new setup manager with the given installation directory
 func NewSetupManager(installDir string) *SetupManager {
 	return &SetupManager{
-		InstallDir: installDir,
-		CondaDir:   filepath.Join(installDir, condaDirName),
-		FDDir:      filepath.Join(installDir, fdDirName),
-		EnvName:    condaEnvName,
+		InstallDir:     installDir,
+		AssetsDir:      filepath.Join(installDir, "assets"),
+		CheckpointsDir: filepath.Join(installDir, "checkpoints"),
 	}
 }
 
-/**
- * downloadCheckpoints: Downloads necessary model weights from R2
- */
+// IsReady checks if the Docker image and necessary model weights exist
+func (s *SetupManager) IsReady() bool {
+	// Check if Docker image exists
+	out, err := exec.Command("docker", "images", "-q", dockerImageName).Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return false
+	}
+
+	// Check for core model weights
+	checkpointFile := filepath.Join(s.CheckpointsDir, "fontdiffuser", "unet", "diffusion_pytorch_model.bin")
+	if _, err := os.Stat(checkpointFile); os.IsNotExist(err) {
+		return false
+	}
+
+	// Check for reference assets
+	if _, err := os.Stat(filepath.Join(s.AssetsDir, "content_refs")); os.IsNotExist(err) {
+		return false
+	}
+
+	return true
+}
+
+// SetupAll runs the full initialization sequence
+func (sm *SetupManager) SetupAll() error {
+	fmt.Println("[System] Downloading required model weights and assets...")
+
+	if err := sm.downloadCheckpoints(); err != nil {
+		return fmt.Errorf("[Error] failed to download checkpoints: %v", err)
+	}
+
+	if err := sm.syncContentRefs(); err != nil {
+		return fmt.Errorf("[Error] failed to sync content refs: %v", err)
+	}
+
+	pkgDir := filepath.Join(sm.InstallDir, "pip_packages")
+	os.RemoveAll(pkgDir)
+	if err := os.MkdirAll(pkgDir, 0755); err != nil {
+		return fmt.Errorf("[Error] failed to create directory: %v", err)
+	}
+	defer os.RemoveAll(pkgDir)
+
+	fmt.Println("[System] Pre-fetching dependencies to ensure stable installation...")
+
+	pythonExe := sm.getPythonExe()
+	if pythonExe == "" {
+		fmt.Println("[Warning] Python not found in PATH. Skipping local pre-fetch.")
+		return sm.buildDockerImage()
+	}
+
+	args := []string{
+		"-m", "pip", "download",
+		"--dest", pkgDir,
+		"--platform", "manylinux_2_17_x86_64",
+		"--platform", "manylinux2014_x86_64",
+		"--platform", "any",
+		"--python-version", "3.9",
+		"--abi", "cp39",
+		"--only-binary=:all:",
+	}
+
+	content, err := os.ReadFile(filepath.Join(sm.InstallDir, "pyproject.toml"))
+	if err != nil {
+		fmt.Println("[Warning] pyproject.toml not found. Only downloading default core.")
+		args = append(args, "huggingface_hub==0.19.4")
+		goto EXECUTE
+	}
+
+	{
+		fileStr := string(content)
+		startTag := "dependencies = ["
+		startIdx := strings.Index(fileStr, startTag)
+		if startIdx == -1 {
+			fmt.Println("[Warning] No 'dependencies' section found in toml.")
+			args = append(args, "huggingface_hub==0.19.4")
+			goto EXECUTE
+		}
+
+		remaining := fileStr[startIdx:]
+		endIdx := strings.Index(remaining, "]")
+		if endIdx == -1 {
+			fmt.Println("[Warning] Malformed dependencies section (missing ']').")
+			goto EXECUTE
+		}
+
+		depZone := remaining[:endIdx]
+		re := regexp.MustCompile(`"(.*?)"`)
+		matches := re.FindAllStringSubmatch(depZone, -1)
+
+		for _, match := range matches {
+			if len(match) <= 1 {
+				continue
+			}
+			args = append(args, match[1])
+		}
+	}
+
+EXECUTE:
+	cmd := exec.Command(pythonExe, args...)
+	cmd.Dir = sm.InstallDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("[Warning] Local pip download failed (%v), will fallback to Docker.\n", err)
+	}
+
+	return sm.buildDockerImage()
+}
+
+func (s *SetupManager) buildDockerImage() error {
+	fmt.Println("\n[Setup] Building Docker Image (using local cache)...")
+
+	dockerfilePath := filepath.Join(s.InstallDir, "Dockerfile")
+	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
+		return fmt.Errorf("Dockerfile not found in %s", s.InstallDir)
+	}
+
+	cmd := exec.Command("docker", "build", "-t", dockerImageName, s.InstallDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 func (s *SetupManager) downloadCheckpoints() error {
 	fmt.Println("\n[Setup] Downloading FontDiffuser weights...")
-
-	ckptDir := filepath.Join(s.FDDir, "checkpoints", "fontdiffuser")
+	ckptDir := filepath.Join(s.CheckpointsDir, "fontdiffuser")
 	_ = os.MkdirAll(ckptDir, 0755)
 
 	baseURL := "https://pub-3372efe59a304a619bc7bc0eec1c9817.r2.dev/"
 	files := []string{"content_encoder.pth", "scr_210000.pth", "style_encoder.pth", "unet.zip"}
 
 	for _, file := range files {
-		url := baseURL + file
 		dest := filepath.Join(ckptDir, file)
+		if _, err := os.Stat(dest); err == nil {
+			continue // Skip if already exists
+		}
 		fmt.Printf("  - Downloading %s...\n", file)
-
-		err := downloadFile(url, dest)
-		if err != nil {
-			return fmt.Errorf("[Error] Failed to download %s: %v", file, err)
+		if err := downloadFile(baseURL+file, dest); err != nil {
+			return fmt.Errorf("failed to download %s: %v", file, err)
 		}
 	}
 
 	zipPath := filepath.Join(ckptDir, "unet.zip")
-	_, err := os.Stat(zipPath)
-	if err != nil {
-		fmt.Println("  [Success] Model weights ready.")
-		return nil
+	if _, err := os.Stat(zipPath); err == nil {
+		fmt.Println("  - unet.zip detected, extracting...")
+		if err := unzipFile(zipPath, ckptDir); err != nil {
+			return fmt.Errorf("unzip unet.zip failed: %v", err)
+		}
+		_ = os.Remove(zipPath)
 	}
-
-	fmt.Println("  - unet.zip detected, extracting...")
-	if err := unzipFile(zipPath, ckptDir); err != nil {
-		return fmt.Errorf("[Error] Unzip unet.zip failed: %v", err)
-	}
-	os.Remove(zipPath)
 
 	fmt.Println("  [Success] Model weights ready.")
 	return nil
@@ -78,14 +189,9 @@ func (s *SetupManager) downloadCheckpoints() error {
  */
 func (s *SetupManager) syncContentRefs() error {
 	fmt.Println("\n[Sync] Syncing content reference library...")
-
-	assetsDir := filepath.Join(s.FDDir, "assets")
-	targetZip := filepath.Join(assetsDir, "content_refs.zip")
-	extractTo := filepath.Join(assetsDir, "content_refs")
-
-	if err := os.MkdirAll(assetsDir, 0755); err != nil {
-		return fmt.Errorf("[Error] Create assets dir failed: %v", err)
-	}
+	targetZip := filepath.Join(s.AssetsDir, "content_refs.zip")
+	extractTo := filepath.Join(s.AssetsDir, "content_refs")
+	_ = os.MkdirAll(s.AssetsDir, 0755)
 
 	if files, _ := os.ReadDir(extractTo); len(files) > 100 {
 		fmt.Println("  - [Ready] Content library already exists.")
@@ -94,96 +200,14 @@ func (s *SetupManager) syncContentRefs() error {
 
 	url := "https://pub-3372efe59a304a619bc7bc0eec1c9817.r2.dev/content_refs.zip"
 	if err := downloadFile(url, targetZip); err != nil {
-		return fmt.Errorf("[Error] Download failed: %v", err)
+		return fmt.Errorf("download failed: %v", err)
 	}
 
 	fmt.Println("  - Extracting content references...")
 	if err := smartUnzipContentRefs(targetZip, extractTo); err != nil {
-		return fmt.Errorf("[Error] Unzip failed: %v", err)
+		return fmt.Errorf("unzip failed: %v", err)
 	}
 	_ = os.Remove(targetZip)
-
-	files, _ := os.ReadDir(extractTo)
-	if len(files) <= 100 {
-		return fmt.Errorf("[Error] Abnormal file count after extraction")
-	}
-
-	fmt.Printf("  - [Success] Library synced: %d files found\n", len(files))
-	return nil
-}
-
-/**
- * installMiniconda: Installs Miniconda runtime based on OS
- */
-func (s *SetupManager) installMiniconda() error {
-	fmt.Println("\n[Setup] Installing Miniconda...")
-	_ = os.MkdirAll(s.InstallDir, 0755)
-
-	url := "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
-	installer := filepath.Join(os.TempDir(), "conda_installer.exe")
-	if runtime.GOOS != "windows" {
-		url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-		installer = filepath.Join(os.TempDir(), "conda_installer.sh")
-	}
-
-	if err := downloadFile(url, installer); err != nil {
-		return err
-	}
-	defer os.Remove(installer)
-
-	cmd := exec.Command("bash", installer, "-b", "-p", s.CondaDir)
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command(installer, "/S", "/InstallationType=JustMe", "/RegisterPython=0", "/AddToPath=0", "/D="+s.CondaDir)
-	}
-	return cmd.Run()
-}
-
-/**
- * downloadFontDiffuser: Clones the latest code from GitHub
- */
-func (s *SetupManager) downloadFontDiffuser() error {
-	if _, err := os.Stat(s.FDDir); err == nil {
-		fmt.Println("  - Source code exists, skipping clone.")
-		return nil
-	}
-
-	fmt.Println("\n[Setup] Cloning FontDiffuser...")
-	cmd := exec.Command("git", "clone", "--depth=1", "https://github.com/yeungchenwa/FontDiffuser.git", s.FDDir)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-/**
- * configureCondaEnv: Creates Python env and installs AI dependencies
- */
-func (s *SetupManager) configureCondaEnv() error {
-	fmt.Println("\n[Config] Setting up environment...")
-	condaExe := filepath.Join(s.CondaDir, getCondaMarker())
-
-	createCmd := exec.Command(condaExe, "create", "-n", s.EnvName, "python=3.9", "-y")
-	if err := createCmd.Run(); err != nil {
-		return fmt.Errorf("[Error] Create env failed: %v", err)
-	}
-
-	pipExe := filepath.Join(s.CondaDir, "envs", s.EnvName, "Scripts", "pip.exe")
-	if runtime.GOOS != "windows" {
-		pipExe = filepath.Join(s.CondaDir, "envs", s.EnvName, "bin", "pip")
-	}
-
-	fmt.Println("  - Installing PyTorch...")
-	torchCmd := exec.Command(pipExe, "install", "torch==2.0.1", "torchvision==0.15.2", "torchaudio==2.0.2", "--index-url", "https://download.pytorch.org/whl/cu118")
-	if err := torchCmd.Run(); err != nil {
-		return fmt.Errorf("[Error] Torch install failed: %v", err)
-	}
-
-	fmt.Println("  - Installing requirements...")
-	reqPath := filepath.Join(s.FDDir, "requirements.txt")
-	if err := exec.Command(pipExe, "install", "-r", reqPath).Run(); err != nil {
-		return fmt.Errorf("[Error] Pip requirements failed: %v", err)
-	}
-
-	exec.Command(pipExe, "install", "huggingface_hub==0.19.4").Run()
 	return nil
 }
 
@@ -195,7 +219,7 @@ func downloadFile(url string, dest string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status code: %d", resp.StatusCode)
+		return fmt.Errorf("server returned status: %d", resp.StatusCode)
 	}
 
 	out, err := os.Create(dest)
@@ -218,13 +242,19 @@ func unzipFile(zipPath, destDir string) error {
 	for _, f := range r.File {
 		fpath := filepath.Join(destDir, f.Name)
 		if f.FileInfo().IsDir() {
-			os.MkdirAll(fpath, f.Mode())
+			_ = os.MkdirAll(fpath, f.Mode())
 			continue
 		}
-		os.MkdirAll(filepath.Dir(fpath), 0755)
-		outFile, _ := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		rc, _ := f.Open()
-		io.Copy(outFile, rc)
+		_ = os.MkdirAll(filepath.Dir(fpath), 0755)
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(outFile, rc)
 		rc.Close()
 		outFile.Close()
 	}
@@ -239,7 +269,7 @@ func smartUnzipContentRefs(zipPath, finalDir string) error {
 	defer r.Close()
 
 	_ = os.RemoveAll(finalDir)
-	os.MkdirAll(finalDir, 0755)
+	_ = os.MkdirAll(finalDir, 0755)
 
 	for _, f := range r.File {
 		rel := strings.Replace(f.Name, "content_refs/", "", 1)
@@ -250,15 +280,37 @@ func smartUnzipContentRefs(zipPath, finalDir string) error {
 
 		target := filepath.Join(finalDir, rel)
 		if f.FileInfo().IsDir() {
-			os.MkdirAll(target, f.Mode())
+			_ = os.MkdirAll(target, f.Mode())
 			continue
 		}
-		os.MkdirAll(filepath.Dir(target), 0755)
-		outFile, _ := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		rc, _ := f.Open()
-		io.Copy(outFile, rc)
+
+		_ = os.MkdirAll(filepath.Dir(target), 0755)
+		outFile, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			continue
+		}
+		_, _ = io.Copy(outFile, rc)
 		rc.Close()
 		outFile.Close()
 	}
 	return nil
+}
+
+func (sm *SetupManager) getPythonExe() string {
+	candidates := []string{"python", "python3"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{"python", "py"}
+	}
+
+	for _, name := range candidates {
+		if _, err := exec.LookPath(name); err == nil {
+			return name
+		}
+	}
+	return ""
 }

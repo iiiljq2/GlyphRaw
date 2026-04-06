@@ -8,56 +8,53 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
 var pythonScripts embed.FS
 
 const (
-	condaDirName = ".env_ai"
-	fdDirName    = "FontDiffuser"
-	condaEnvName = "fontdiffuser"
+	dockerImageName = "fontdiffuser-env:latest"
 )
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 	exeDir := getExeDir()
 
-	fmt.Println("==============================================")
-	fmt.Println("       FontDiffuser Font Generator v0.6       ")
-	fmt.Println("==============================================")
+	fmt.Println("================================================================")
+	fmt.Println("  ____ _             _     ____                ")
+	fmt.Println(" / ___| |_   _ _ __ | |__ |  _ \\ __ ___      __")
+	fmt.Println("| |  _| | | | | '_ \\| '_ \\| |_) / _` \\ \\ /\\ / /")
+	fmt.Println("| |_| | | |_| | |_) | | | |  _ < (_| |\\ V  V / ")
+	fmt.Println(" \\____|_|\\__, | .__/|_| |_|_| \\_\\__,_| \\_/\\_/  ")
+	fmt.Println("         |___/|_|                              ")
+	fmt.Println("================================================================")
 
-	condaExe, _ := detectConda(exeDir)
-	hasCondaEnv := checkCondaEnv(condaExe, condaEnvName)
-	fdDir, _ := detectFontDiffuser(exeDir)
-	hasFD := fdDir != ""
+	if !checkDocker() {
+		fmt.Println("[Error] Docker is not installed or not running. Please install/start Docker Desktop.")
+		waitExit(reader)
+		return
+	}
 
-	// Guard: Environment setup
-	if condaExe == "" || !hasCondaEnv || !hasFD {
-		fmt.Print("\n[System] Missing components. Install automatically? (Y/N): ")
+	sm := NewSetupManager(exeDir)
+
+	if !sm.IsReady() {
+		fmt.Print("\n[System] Missing components (Docker image or assets). Setup automatically? (Y/N): ")
 		if !readYesNo(reader) {
 			fmt.Println("Please setup manually.")
 			waitExit(reader)
 			return
 		}
 
-		sm := NewSetupManager(exeDir)
-		if !hasFD {
-			sm.downloadFontDiffuser()
-			sm.downloadCheckpoints()
-			sm.syncContentRefs()
-			fdDir = sm.FDDir
-		}
-		if condaExe == "" {
-			sm.installMiniconda()
-			sm.configureCondaEnv()
-			condaExe = filepath.Join(sm.CondaDir, getCondaMarker())
+		if err := sm.SetupAll(); err != nil {
+			fmt.Printf("\n[Error] Setup failed: %v\n", err)
+			waitExit(reader)
+			return
 		}
 		fmt.Println("[Success] Setup complete!")
 	}
 
-	fmt.Print("\nEnter path to handwritten image (file/folder): ")
+	fmt.Print("\nEnter path to handwritten image (file or folder): ")
 	styleInput := readTrimmed(reader)
 	if styleInput == "" {
 		return
@@ -66,7 +63,7 @@ func main() {
 	outputBase := filepath.Join(exeDir, "article_output")
 	_ = os.MkdirAll(outputBase, 0755)
 
-	if err := runArticleInference(condaExe, fdDir, styleInput, outputBase); err != nil {
+	if err := runArticleInferenceDocker(sm, styleInput, outputBase); err != nil {
 		fmt.Printf("\n[Error] Task failed: %v\n", err)
 	} else {
 		fmt.Printf("\n[Success] All tasks done. Saved to: %s\n", outputBase)
@@ -75,29 +72,23 @@ func main() {
 	waitExit(reader)
 }
 
-/**
-* runArticleInference: Iterates style images and generates characters
-* - condaExe: Path to conda
-* - fdDir: FontDiffuser root
-* - styleInput: Source style path
-* - outputBase: Output folder
- */
-func runArticleInference(condaExe, fdDir, styleInput, outputBase string) error {
-	pyExe := getPythonExe(condaExe)
-	if _, err := os.Stat(pyExe); err != nil {
-		return fmt.Errorf("python missing: %s", pyExe)
+// Docker Inference Logic
+func runArticleInferenceDocker(sm *SetupManager, styleInput, outputBase string) error {
+	styleImages, err := collectStyleImages(styleInput)
+	if err != nil || len(styleImages) == 0 {
+		return fmt.Errorf("no valid style images found in %s", styleInput)
 	}
 
-	styleImages, _ := collectStyleImages(styleInput)
-	if len(styleImages) == 0 {
-		return fmt.Errorf("no images found")
-	}
-
-	refsDir := filepath.Join(fdDir, "assets", "content_refs")
+	refsDir := filepath.Join(sm.AssetsDir, "content_refs")
 	contentFiles, err := os.ReadDir(refsDir)
 	if err != nil {
-		return fmt.Errorf("reference assets missing")
+		return fmt.Errorf("reference assets missing in %s", refsDir)
 	}
+
+	absAssets, _ := filepath.Abs(sm.AssetsDir)
+	absCheckpoints, _ := filepath.Abs(sm.CheckpointsDir)
+	absOutput, _ := filepath.Abs(outputBase)
+	absInputBase, _ := filepath.Abs(filepath.Dir(styleImages[0]))
 
 	for _, stylePath := range styleImages {
 		styleName := strings.TrimSuffix(filepath.Base(stylePath), filepath.Ext(stylePath))
@@ -118,33 +109,54 @@ func runArticleInference(condaExe, fdDir, styleInput, outputBase string) error {
 
 			fmt.Printf("[%d/%d] Generating: %s\r", i+1, len(contentFiles), charName)
 
-			cmd := exec.Command(pyExe, "sample.py",
-				"--style_image_path", stylePath,
-				"--content_image_path", filepath.Join("assets", "content_refs", file.Name()),
-				"--save_image_dir", charDir,
-				"--save_image",
-				"--ckpt_dir", "checkpoints/fontdiffuser",
-				"--device", "cuda",
-			)
-			cmd.Dir = fdDir
-			if cmd.Run() != nil {
-				continue
+			// Container path mappings
+			containerStylePath := fmt.Sprintf("/input_data/%s", filepath.Base(stylePath))
+			containerContentPath := fmt.Sprintf("/app/assets/content_refs/%s", file.Name())
+			containerSaveDir := fmt.Sprintf("/output_data/%s/%s", styleName, charName)
+
+			// Build Docker command
+			dockerArgs := []string{
+				"run", "--rm",
+				"--gpus", "all",
+				"-v", fmt.Sprintf("%s:/app/assets", absAssets),
+				"-v", fmt.Sprintf("%s:/app/checkpoints", absCheckpoints),
+				"-v", fmt.Sprintf("%s:/input_data:ro", absInputBase),
+				"-v", fmt.Sprintf("%s:/output_data", absOutput),
 			}
 
-			// Rename output
+			dockerArgs = append(dockerArgs,
+				dockerImageName,
+				"python", "sample.py",
+				"--style_image_path", containerStylePath,
+				"--content_image_path", containerContentPath,
+				"--save_image_dir", containerSaveDir,
+				"--save_image",
+				"--ckpt_dir", "/app/checkpoints/fontdiffuser",
+				"--device", "cuda",
+			)
+
+			cmd := exec.Command("docker", dockerArgs...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("\n[Error] Docker failed for character %s: %v\n", charName, err)
+				return err
+			}
+
+			// Rename output file on host
 			src := filepath.Join(charDir, "out_single.png")
 			dst := filepath.Join(charDir, charName+"_single.png")
 			if _, err := os.Stat(src); err == nil {
-				os.Rename(src, dst)
+				_ = os.Rename(src, dst)
 				successCount++
 			}
 		}
 
 		fmt.Printf("\n[Success] %s: Generated %d images.\n", styleName, successCount)
 
-		// Pack to TTF
+		// Pack to TTF via Docker
 		ttfPath := filepath.Join(outputBase, styleName+".ttf")
-		if err := packFontToTTF(pyExe, styleOutputDir, ttfPath); err != nil {
+		if err := packFontToTTFDocker(absOutput, styleName, styleName+".ttf"); err != nil {
 			fmt.Printf("[Error] Pack TTF failed: %v\n", err)
 		} else {
 			fmt.Printf("[Success] Font saved: %s\n", ttfPath)
@@ -153,23 +165,40 @@ func runArticleInference(condaExe, fdDir, styleInput, outputBase string) error {
 	return nil
 }
 
-/**
-* packFontToTTF: Converts character images into a font file
- */
-func packFontToTTF(pyExe, inputDir, outputTtf string) error {
+func packFontToTTFDocker(absOutput, styleName, ttfName string) error {
+	// Extract the embedded python script to the output directory so Docker can access it
 	script, _ := pythonScripts.ReadFile("scripts/pack_font.py")
-	temp := filepath.Join(os.TempDir(), "temp_pack.py")
-	os.WriteFile(temp, script, 0644)
-	defer os.Remove(temp)
+	tempScript := filepath.Join(absOutput, "temp_pack.py")
+	_ = os.WriteFile(tempScript, script, 0644)
+	defer os.Remove(tempScript)
 
-	cmd := exec.Command(pyExe, temp, inputDir, outputTtf)
+	containerInputDir := fmt.Sprintf("/output_data/%s", styleName)
+	containerOutputFile := fmt.Sprintf("/output_data/%s", ttfName)
+
+	cmd := exec.Command("docker", "run", "--rm",
+		"-v", fmt.Sprintf("%s:/output_data", absOutput),
+		dockerImageName,
+		"python", "/output_data/temp_pack.py", containerInputDir, containerOutputFile,
+	)
+
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
-
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%v: %s", err, errBuf.String())
 	}
 	return nil
+}
+
+// --- Utility Functions ---
+
+func checkDocker() bool {
+	_, err := exec.LookPath("docker")
+	if err != nil {
+		return false
+	}
+	// Check if Docker daemon is running
+	err = exec.Command("docker", "info").Run()
+	return err == nil
 }
 
 func collectStyleImages(input string) ([]string, error) {
@@ -177,13 +206,11 @@ func collectStyleImages(input string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	var imgs []string
 	if !info.IsDir() {
 		imgs = append(imgs, input)
 		return imgs, nil
 	}
-
 	files, _ := os.ReadDir(input)
 	for _, f := range files {
 		ext := strings.ToLower(filepath.Ext(f.Name()))
@@ -194,56 +221,9 @@ func collectStyleImages(input string) ([]string, error) {
 	return imgs, nil
 }
 
-func getPythonExe(condaExe string) string {
-	root := filepath.Dir(filepath.Dir(condaExe))
-	if runtime.GOOS == "windows" {
-		return filepath.Join(root, "envs", condaEnvName, "python.exe")
-	}
-	return filepath.Join(root, "envs", condaEnvName, "bin", "python")
-}
-
-func detectConda(exeDir string) (string, string) {
-	if p, err := exec.LookPath("conda"); err == nil {
-		return p, "Global"
-	}
-	local := filepath.Join(exeDir, condaDirName, getCondaMarker())
-	if _, err := os.Stat(local); err == nil {
-		return local, "Local"
-	}
-	return "", ""
-}
-
-func checkCondaEnv(condaExe, envName string) bool {
-	out, _ := exec.Command(condaExe, "env", "list").Output()
-	return strings.Contains(string(out), envName)
-}
-
-func detectFontDiffuser(exeDir string) (string, string) {
-	local := filepath.Join(exeDir, fdDirName)
-	if _, err := os.Stat(filepath.Join(local, "README.md")); err == nil {
-		return local, "Local"
-	}
-	return "", ""
-}
-
 func getExeDir() string {
 	exe, _ := os.Executable()
 	return filepath.Dir(exe)
-}
-
-func getCondaMarker() string {
-	if runtime.GOOS == "windows" {
-		return filepath.Join("condabin", "conda.bat")
-	}
-	return filepath.Join("bin", "conda")
-}
-
-func printStatus(name, path string, ok bool) {
-	if ok {
-		fmt.Printf(" [Success] %s: %s\n", name, path)
-	} else {
-		fmt.Printf(" [Failure] %s: Not found\n", name)
-	}
 }
 
 func readYesNo(r *bufio.Reader) bool {
@@ -259,5 +239,5 @@ func readTrimmed(r *bufio.Reader) string {
 
 func waitExit(r *bufio.Reader) {
 	fmt.Print("\nDone. Press Enter to exit.")
-	r.ReadString('\n')
+	_, _ = r.ReadString('\n')
 }

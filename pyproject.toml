@@ -1,0 +1,15 @@
+[project]
+name = "font-diffuser"
+version = "0.1.0"
+dependencies = [
+    "huggingface_hub==0.19.4",
+    "transformers==4.33.1",
+    "accelerate==0.23.0",
+    "diffusers==0.22.0",
+    "gradio==4.8.0",
+    "pyyaml",
+    "pygame",
+    "opencv-python",
+    "info-nce-pytorch",
+    "kornia"
+]
