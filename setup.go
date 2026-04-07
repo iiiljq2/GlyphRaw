@@ -162,9 +162,14 @@ func (s *SetupManager) downloadCheckpoints() error {
 
 	for _, file := range files {
 		dest := filepath.Join(ckptDir, file)
-		if _, err := os.Stat(dest); err == nil {
-			continue // Skip if already exists
+		finalPath := filepath.Join(ckptDir, strings.TrimSuffix(file, ".zip")+".pth")
+		if _, err := os.Stat(finalPath); err == nil {
+			continue
 		}
+		if _, err := os.Stat(dest); err == nil {
+			continue
+		}
+
 		fmt.Printf("  - Downloading %s...\n", file)
 		if err := downloadFile(baseURL+file, dest); err != nil {
 			return fmt.Errorf("failed to download %s: %v", file, err)
@@ -172,13 +177,16 @@ func (s *SetupManager) downloadCheckpoints() error {
 	}
 
 	zipPath := filepath.Join(ckptDir, "unet.zip")
-	if _, err := os.Stat(zipPath); err == nil {
-		fmt.Println("  - unet.zip detected, extracting...")
-		if err := unzipFile(zipPath, ckptDir); err != nil {
-			return fmt.Errorf("unzip unet.zip failed: %v", err)
-		}
-		_ = os.Remove(zipPath)
+	if _, err := os.Stat(zipPath); err != nil {
+		fmt.Println("  [Success] Model weights ready.")
+		return nil
 	}
+
+	fmt.Println("  - unet.zip detected, extracting...")
+	if err := unzipFile(zipPath, ckptDir); err != nil {
+		return fmt.Errorf("unzip unet.zip failed: %v", err)
+	}
+	_ = os.Remove(zipPath)
 
 	fmt.Println("  [Success] Model weights ready.")
 	return nil
