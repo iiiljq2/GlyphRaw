@@ -1,0 +1,6 @@
+ckpt/
+article_output/
+data_examples/
+.git
+*.zip
+*.pth
