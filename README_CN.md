@@ -113,6 +113,10 @@ glyphraw/
 - [FontDiffuser](https://github.com/yeungchenwa/FontDiffuser) - 原始深度学习模型
 - [FontForge](https://github.com/fontforge/fontforge) - 字体生成引擎
 
+## 声明
+
+> 本项目为个人开源项目，不用于任何商业用途，且不得被用于任何商业用途。
+
 ## 支持
 如果你在使用过程中遇到问题，或者有任何改进建议，欢迎通过以下方式联系我获取帮助：
 

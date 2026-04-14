@@ -115,6 +115,10 @@ Check `article_output/[stylename]/` for generated PNG files and review logs.
 - [FontDiffuser](https://github.com/yeungchenwa/FontDiffuser) - Original deep learning model
 - [FontForge](https://github.com/fontforge/fontforge) - Font generation engine
 
+## Disclaimer
+
+> This project is a personal open-source initiative. It is not intended for commercial use, and it must not be used for any commercial purposes.
+
 ## Support
 If you encounter any issues or have any suggestions for improvement, please feel free to reach out for assistance through the following channels:
 
