@@ -110,8 +110,8 @@ glyphraw/
 
 ## 相关项目
 
-- [FontDiffuser] - 原始深度学习模型
-- [FontForge] - 字体生成引擎
+- [FontDiffuser](https://github.com/yeungchenwa/FontDiffuser) - 原始深度学习模型
+- [FontForge](https://github.com/fontforge/fontforge) - 字体生成引擎
 
 ## 支持
 如果你在使用过程中遇到问题，或者有任何改进建议，欢迎通过以下方式联系我获取帮助：
@@ -120,4 +120,4 @@ glyphraw/
 
 ---
 
-**维护者**: iiiljq
+**维护者**: iiiljq(Hunter)
