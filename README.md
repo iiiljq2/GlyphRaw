@@ -20,20 +20,13 @@
 - **Docker**: Version 20.0 or higher
 - **GPU** (recommended): NVIDIA GPU with CUDA 11.7 support (minimum 4GB VRAM)
 
-## Installation
+### Software Dependencies
+All Python dependencies are automatically handled by the Docker image. The application manages:
 
-### From Source
-
-```bash
-git clone https://github.com/iiiljq/glyphraw.git
-cd glyphraw
-go build -o glyphraw ./
-```
-
-On Windows:
-```bash
-go build -o glyphraw.exe ./
-```
+- PyTorch 2.0.0 with CUDA 11.7
+- FontDiffuser model and dependencies
+- FontForge for font generation
+- Required Python libraries (diffusers, transformers, etc.)
 
 ## Quick Start
 
@@ -89,9 +82,6 @@ glyphraw/
 
 ### Docker Not Running
 Install Docker Desktop from https://www.docker.com/ and start it.
-
-### Out of Disk Space
-Models require ~2-3GB. Delete `checkpoints/` and `assets/` directories and restart.
 
 ### Low GPU Memory
 Close other GPU-consuming applications. The model requires at least 4GB+ VRAM for stable performance.
